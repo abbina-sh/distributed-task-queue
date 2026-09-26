@@ -9,6 +9,7 @@ PREFIX = "dtq"
 
 PENDING = f"{PREFIX}:pending"        # list  — tasks waiting for a worker
 PROCESSING = f"{PREFIX}:processing"  # list  — tasks currently leased
+DELAYED = f"{PREFIX}:delayed"        # zset  — retries waiting out their backoff, scored by due time
 DLQ = f"{PREFIX}:dlq"                # list  — tasks that exhausted their attempts
 
 
