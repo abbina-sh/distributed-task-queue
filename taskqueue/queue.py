@@ -107,6 +107,16 @@ return #due
 """
 
 
+# KEYS: task hash, dlq, pending
+# ARGV: task id, now
+_REPLAY = """
+if redis.call('LREM', KEYS[2], 1, ARGV[1]) == 0 then return 0 end
+redis.call('HSET', KEYS[1], 'state', 'pending', 'attempts', 0, 'updated_at', ARGV[2])
+redis.call('LPUSH', KEYS[3], ARGV[1])
+return 1
+"""
+
+
 def _script(name: str, source: str):
     # register_script caches the SHA and falls back to EVAL on NOSCRIPT, so a
     # Redis restart doesn't break us
@@ -257,6 +267,23 @@ def stats() -> dict[str, int]:
     }
 
 
-def replay(task_id: str) -> None:
-    """Move a task from the DLQ back to `pending` with attempts reset to 0."""
-    raise NotImplementedError
+def dead_letters(limit: int = 50, offset: int = 0) -> list[Task]:
+    """Tasks in the DLQ, most recently dead-lettered first."""
+    ids = client().lrange(keys.DLQ, offset, offset + limit - 1)
+    pipe = client().pipeline(transaction=False)
+    for task_id in ids:
+        pipe.hgetall(keys.task(task_id))
+    return [Task.from_redis(raw) for raw in pipe.execute() if raw]
+
+
+def replay(task_id: str) -> bool:
+    """Move a task from the DLQ back to `pending` with attempts reset to 0.
+
+    last_error is kept so you can still see why it died the first time.
+    Returns False if the task isn't in the DLQ.
+    """
+    ok = _script("replay", _REPLAY)(
+        keys=[keys.task(task_id), keys.DLQ, keys.PENDING],
+        args=[task_id, time.time()],
+    )
+    return bool(ok)
