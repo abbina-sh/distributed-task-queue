@@ -17,7 +17,7 @@ renewed is reclaimed and redelivered.
    POST /tasks
         |
         v
-  +-------------+        BRPOPLPUSH        +--------------+
+  +-------------+          BLMOVE          +--------------+
   |  pending    | -----------------------> |  processing  |
   |  (list)     |                          |  (list)      |
   +-------------+                          +--------------+
@@ -36,13 +36,16 @@ renewed is reclaimed and redelivered.
         +---------------------------------|  dlq (list)  |
                                           +--------------+
 
+  failed attempt: task waits in `delayed` (zset, scored by due time) until
+                  its backoff is up, then gets promoted back to `pending`
+
   reaper loop: scans `processing` for tasks whose lease_expires_at < now,
                moves them back to `pending`, increments attempts
 ```
 
 ### Key design decisions
 
-**`BRPOPLPUSH` for the pending → processing move.** This is atomic. A worker cannot
+**`BLMOVE` for the pending → processing move.** This is atomic. A worker cannot
 pop a task and then die before recording that it holds it — the task is in `processing`
 the instant it leaves `pending`. This is what makes at-least-once delivery possible.
 
@@ -56,9 +59,22 @@ acknowledging it, so that task will run twice. This is a deliberate trade: exact
 requires distributed transactions across Redis and whatever the task touches. **Handlers
 must be idempotent** — that requirement is pushed to the caller rather than faked here.
 
+**State changes are Lua scripts.** Anything that moves an id between lists *and*
+updates the task hash (claim, ack, nack, reclaim, replay) runs as one script, so
+Redis applies it atomically. Each script also re-checks the task's state and owner
+first — that's what stops a worker that stalled past its lease from acking a task
+the reaper already handed to someone else.
+
+**Retries wait in a sorted set.** A failed attempt goes into `delayed` scored by
+`now + backoff`, and gets promoted to `pending` once it's due. Workers promote due
+retries while they block on `lease()`, and the reaper does it too in case every
+worker is down.
+
 **Retries carry attempt count in the task hash, not the payload.** Requeuing is then a
 list operation plus a field increment, and the backoff schedule can change without
 rewriting in-flight tasks.
+
+Design notes and the reasoning behind each choice are in [`docs/`](docs/README.md).
 
 ## Layout
 
@@ -68,12 +84,17 @@ taskqueue/
   models.py     Task, TaskState, serialization
   keys.py       Redis key naming — one place, so nothing drifts
   queue.py      Enqueue, lease, ack, retry, DLQ routing
+  handlers.py   Handler registry + built-in handlers (noop, sleep, fail, flaky)
   worker.py     Worker pool, heartbeat/lease renewal, handler dispatch
   reaper.py     Lease-expiry scan and orphan requeue
   backoff.py    Exponential backoff with jitter
   api.py        FastAPI control plane
 tests/
-  ...           Including a real crash-recovery test
+  test_queue.py     Lease/ack/nack/retry behaviour
+  test_reaper.py    Lease expiry, double reaping, poison tasks
+  test_worker.py    Heartbeats, stale owners, and killing a real worker process mid-task
+  test_api.py       REST endpoints incl. DLQ replay
+  test_recovery.py  The original spec tests
 ```
 
 ## Running it
@@ -93,15 +114,47 @@ Or the whole stack:
 docker compose up --build
 ```
 
+Try it:
+
+```bash
+curl -X POST localhost:8000/tasks -H 'content-type: application/json'      -d '{"handler": "sleep", "payload": {"seconds": 20}}'
+
+docker compose kill worker        # kill workers mid-task
+docker compose up -d worker       # ...the reaper puts the task back, a new worker finishes it
+
+curl localhost:8000/tasks/<id>    # attempts: 1, last_error: "lease expired (owner: ...)"
+```
+
+Custom handlers:
+
+```python
+from taskqueue.handlers import handler
+
+@handler("send_email")
+def send_email(payload):
+    ...  # must be idempotent, it can run more than once
+```
+
+## Tests
+
+Tests run against a real Redis (no mocks — the atomicity is the thing being tested).
+They default to db 15 and flush it, so don't point them at anything you care about.
+
+```bash
+docker compose up -d redis
+pytest -v
+```
+
 ## API
 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/tasks` | Enqueue a task |
 | `GET` | `/tasks/{id}` | Task state, attempts, last error |
-| `GET` | `/stats` | Queue depths by state |
-| `GET` | `/dlq` | List dead-lettered tasks |
+| `GET` | `/stats` | Queue depths (pending, processing, delayed, dlq) |
+| `GET` | `/dlq?limit=&offset=` | List dead-lettered tasks, newest first |
 | `POST` | `/dlq/{id}/replay` | Move a task from the DLQ back to pending |
+| `GET` | `/health` | Redis connectivity check |
 
 ## Configuration
 
@@ -118,11 +171,13 @@ docker compose up --build
 
 ## Roadmap
 
-- [ ] Implement `queue.py` lease/ack/retry paths
-- [ ] Implement `worker.py` heartbeat renewal
-- [ ] Implement `reaper.py` orphan scan
-- [ ] Crash-recovery test: kill a worker mid-task, assert redelivery
-- [ ] Delayed retries via a Redis sorted set instead of immediate requeue
+- [x] Implement `queue.py` lease/ack/retry paths
+- [x] Implement `worker.py` heartbeat renewal
+- [x] Implement `reaper.py` orphan scan
+- [x] Crash-recovery test: kill a worker mid-task, assert redelivery
+- [x] Delayed retries via a Redis sorted set instead of immediate requeue
+- [x] CI with a Redis service container
+- [ ] Priority queues
 - [ ] Prometheus metrics endpoint
 - [ ] Deploy to Cloud Run / ECS
 
